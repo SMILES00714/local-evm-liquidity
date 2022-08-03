@@ -30,18 +30,6 @@ impl Provider {
         T: Serialize,
         U: DeserializeOwned,
     {
-        let result = self.try_exec(method, params);
-        if let Err(err) = &result {
-            dbg!(err);
-        }
-        result
-    }
-
-    fn try_exec<T, U>(&self, method: &str, params: T) -> Result<U>
-    where
-        T: Serialize,
-        U: DeserializeOwned,
-    {
         let request = serde_json::to_vec(&json!({
             "id": 42,
             "jsonrpc": "2.0",
@@ -70,7 +58,9 @@ impl Provider {
             transfer.perform()?;
         }
 
-        Ok(serde_json::from_slice::<Response<_>>(&response)?.result)
+        Ok(serde_json::from_slice::<Response<_>>(&response)
+            .with_context(|| format!("RPC error {}", String::from_utf8_lossy(&response)))?
+            .result)
     }
 
     pub fn block_number(&self) -> Result<U256> {

@@ -1,92 +1,85 @@
 use crate::provider::Provider;
 use anyhow::{bail, ensure, Context as _, Result};
 use primitive_types::{H160, H256, U256};
-use revm::{AccountInfo, Bytecode, Database, Return, TransactOut, TransactTo, EVM, KECCAK_EMPTY};
-use std::collections::HashMap;
+use revm::{
+    db::{CacheDB, DatabaseRef},
+    AccountInfo, Bytecode, Return, TransactOut, TransactTo, EVM, KECCAK_EMPTY,
+};
+use std::fmt::{self, Debug, Formatter};
 
 #[derive(Debug)]
 pub struct State {
     provider: Provider,
-    cache: Cache,
-}
-
-#[derive(Debug, Default)]
-struct Cache {
     block: U256,
-    accounts: HashMap<H160, AccountInfo>,
-    storage: HashMap<(H160, U256), U256>,
 }
 
 impl State {
     pub fn new(provider: Provider) -> Result<Self> {
         let block = provider.block_number()? - 5;
-        Ok(Self {
-            provider,
-            cache: Cache {
-                block,
-                ..Default::default()
-            },
+        Ok(Self { provider, block })
+    }
+}
+
+impl DatabaseRef for State {
+    fn basic(&self, address: H160) -> AccountInfo {
+        try_and_log_err(|| {
+            let code = match self.provider.get_code(address, self.block)? {
+                code if code.is_empty() => None,
+                code => Some(Bytecode::new_raw(code.into())),
+            };
+
+            Ok(AccountInfo {
+                balance: self.provider.get_balance(address, self.block)?,
+                nonce: self
+                    .provider
+                    .get_transaction_count(address, self.block)?
+                    .as_u64(),
+                code_hash: code
+                    .as_ref()
+                    .map(|code| code.hash())
+                    .unwrap_or(KECCAK_EMPTY),
+                code,
+            })
         })
     }
-}
 
-impl Database for State {
-    fn basic(&mut self, address: H160) -> AccountInfo {
-        self.cache
-            .accounts
-            .entry(address)
-            .or_insert_with(|| {
-                load_account_info(&self.provider, address, self.cache.block).unwrap_or_default()
-            })
-            .clone()
-    }
-
-    fn code_by_hash(&mut self, _: H256) -> Bytecode {
+    fn code_by_hash(&self, _: H256) -> Bytecode {
         unimplemented!()
     }
 
-    fn storage(&mut self, address: H160, index: U256) -> U256 {
-        *self
-            .cache
-            .storage
-            .entry((address, index))
-            .or_insert_with(|| {
-                self.provider
-                    .get_storage_at(address, index, self.cache.block)
-                    .unwrap_or_default()
-            })
+    fn storage(&self, address: H160, index: U256) -> U256 {
+        try_and_log_err(|| self.provider.get_storage_at(address, index, self.block))
     }
 
-    fn block_hash(&mut self, _: U256) -> H256 {
+    fn block_hash(&self, _: U256) -> H256 {
         unimplemented!()
     }
 }
 
-fn load_account_info(provider: &Provider, address: H160, block: U256) -> Result<AccountInfo> {
-    let code = match provider.get_code(address, block)? {
-        code if code.is_empty() => None,
-        code => Some(Bytecode::new_raw(code.into())),
-    };
-
-    Ok(AccountInfo {
-        balance: provider.get_balance(address, block)?,
-        nonce: provider.get_transaction_count(address, block)?.as_u64(),
-        code_hash: code
-            .as_ref()
-            .map(|code| code.hash())
-            .unwrap_or(KECCAK_EMPTY),
-        code,
-    })
+fn try_and_log_err<T, F>(result: F) -> T
+where
+    T: Default,
+    F: FnOnce() -> Result<T>,
+{
+    match result() {
+        Ok(value) => value,
+        Err(err) => {
+            dbg!(err);
+            T::default()
+        }
+    }
 }
 
 pub struct Vm {
-    evm: EVM<State>,
+    evm: EVM<CacheDB<State>>,
 }
 
 impl Vm {
     pub fn new(provider: Provider) -> Result<Self> {
+        let db = CacheDB::new(State::new(provider)?);
+
         let mut evm = revm::new();
-        evm.database(State::new(provider)?);
+        evm.database(db);
         evm.env.cfg.perf_all_precompiles_have_balance = true;
 
         Ok(Self { evm })
@@ -103,6 +96,15 @@ impl Vm {
             to.parse()?,
             hex::decode(data.strip_prefix("0x").context("missing 0x- prefix")?)?,
         ))
+    }
+}
+
+impl Debug for Vm {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.debug_struct("Vm")
+            .field("env", &self.evm.env)
+            .field("db", self.evm.db.as_ref().unwrap())
+            .finish()
     }
 }
 
